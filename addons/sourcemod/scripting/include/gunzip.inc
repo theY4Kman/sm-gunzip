@@ -57,6 +57,13 @@
 #define GZ_OS_ACORN         13  // Acorn RISCOS
 #define GZ_OS_UNKNOWN       255 // Unknown
 
+#define GZ_LAST_BLOCK       1
+
+#define GZ_BLOCK_STORED     0
+#define GZ_BLOCK_FIXED      1
+#define GZ_BLOCK_DYNAMIC    2
+#define GZ_BLOCK_RESERVED   3
+
 
 // =============================================================================
 //  Library defines
@@ -232,10 +239,10 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
         }
         
         // FOR DEBUGGING PURPOSES ONLY
-        _PrintMemberToServer(member_id1, member_id2, member_cm, member_flg,
-                             member_mtime, member_xfl, member_os, member_crc32,
-                             member_isize, member_xlen, member_fname,
-                             member_fcomment, member_crc16);
+        _gz_PrintMemberToServer(member_id1, member_id2, member_cm, member_flg,
+                                member_mtime, member_xfl, member_os,
+                                member_crc32, member_isize, member_xlen,
+                                member_fname, member_fcomment, member_crc16);
         
         // Open the output file
         if (current_member > 0)
@@ -251,6 +258,19 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
         // Make sure we can write to the output file
         if (Handle:_state[GZ_STATE_OUT] == INVALID_HANDLE)
             __GZ_ERROR(GZ_ERROR_OUTPUT_FILE_BAD)
+        
+        // Loop through all the compressed blocks
+        while (true)
+        {
+            decl last_block;
+            _GZ_BITS(last_block,1);
+                        
+            decl block_type;
+            _GZ_BITS(block_type,2);
+            
+            if (last_block)
+                break;
+        }
         
         current_member++;
     }
@@ -299,11 +319,11 @@ stock GetErrorMessage(errcode, String:message[], maxlength)
 //  Library-use functions, forward compatability not guaranteed whatsoever
 // =============================================================================
 
-stock _PrintMemberToServer(id1, id2, cm, flg, mtime, xfl, os, crc32, isize,
+stock _gz_PrintMemberToServer(id1, id2, cm, flg, mtime, xfl, os, crc32, isize,
                            xlen, const String:fname[], const String:fcomment[],
                            crc16)
 {
-#ifndef DEBUG
+#if defined(DEBUG)
     return;
 #endif
     
@@ -324,7 +344,13 @@ stock _PrintMemberToServer(id1, id2, cm, flg, mtime, xfl, os, crc32, isize,
     PrintToServer("   reserved - %d", __GZ_FLG(7));
 }
 
-stock _bits(_state[GZ_STATE_SIZE], need)
+#define _GZ_BITS(%1,%2) \
+    %1 = _gz_bits(_state, (%2)); \
+    if (%1 == -1 && _state[GZ_STATE_ERROR]) \
+        __GZ_ERROR(_state[GZ_STATE_ERROR])
+#define fixing_syntax_highlighting_in_textmate
+
+stock _gz_bits(_state[GZ_STATE_SIZE], need)
 {
     decl val;
     
@@ -351,4 +377,33 @@ stock _bits(_state[GZ_STATE_SIZE], need)
     
     /* Return `need` bits, zeroing the bits above that */
     return val & ((1 << need) - 1);
+}
+
+#define _GZ_BYTE(%1) \
+    %1 = _gz_byte(_state); \
+    if (%1 == -1 && _state[GZ_STATE_ERROR]) \
+        __GZ_ERROR(_state[GZ_STATE_ERROR])
+#define fixing_syntax_highlighting_in_textmate
+
+stock _gz_byte(_state[GZ_STATE_SIZE], peek)
+{
+    decl buf[1];
+    decl loc;
+    
+    if (peek)
+        loc = FilePosition(_state[GZ_STATE_IN]);
+    
+    new ret = ReadFile(_state[GZ_STATE_IN], buf, 1, 1);
+    if (ret != 1)
+    {
+        _state[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
+        if (ret != -1)
+            _state[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
+        return -1;
+    }
+    
+    if (peek)
+        FileSeek(_state[GZ_STATE_IN], loc);
+    
+    return buf[0];
 }
