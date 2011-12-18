@@ -90,11 +90,13 @@
 // 1-999: gzip errors
 #define GZ_ERROR_BAD_MEMBER_HEADER      0001
 #define GZ_ERROR_UNIMPLEMENTED_CM       0002
+#define GZ_ERROR_BAD_BLOCK              0003
 
 // >= 9000: library errors
 #define GZ_ERROR_END_OF_FILE            9000
 #define GZ_ERROR_INPUT_FILE_BAD         9001
 #define GZ_ERROR_OUTPUT_FILE_BAD        9002
+#define GZ_ERROR_NOT_IMPLEMENTED        9003
 
 
 // =============================================================================
@@ -137,13 +139,15 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
         { \
             errcode = %1; \
             GetErrorMessage(%1, error, maxlength); \
-            Format(error, maxlength, "%s in member %d", error, current_member+1); \
+            Format(error, maxlength, "%s in member %d", error, \
+                   current_member); \
             CloseHandle(gzfp); \
             return -1; \
         }
 
-        decl _state[GZ_STATE_SIZE];
+        new _state[GZ_STATE_SIZE];
         _state[GZ_STATE_IN] = _:gzfp;
+        _state[GZ_STATE_ERROR] = GZ_ERROR_SUCCESS;
         
         // Member header declarations
         new member_id1      = 0,
@@ -260,16 +264,46 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
             __GZ_ERROR(GZ_ERROR_OUTPUT_FILE_BAD)
         
         // Loop through all the compressed blocks
-        while (true)
+        new True = true;
+        new current_block = 0;
+        while (True)
         {
-            decl last_block;
-            _GZ_BITS(last_block,1);
+            #undef __GZ_ERROR
+            #define __GZ_ERROR(%1) \
+            { \
+                errcode = %1; \
+                GetErrorMessage(%1, error, maxlength); \
+                Format(error, maxlength, "%s in member %d, block %d", error, \
+                       current_member, current_block); \
+                CloseHandle(gzfp); \
+                return -1; \
+            }
+            
+            new last_block = _gz_bits(_state, 1);
+            if (last_block == -1 && _state[GZ_STATE_ERROR])
+                __GZ_ERROR(_state[GZ_STATE_ERROR])
                         
-            decl block_type;
-            _GZ_BITS(block_type,2);
+            new block_type = _gz_bits(_state, 2);
+            if (block_type == -1 && _state[GZ_STATE_ERROR])
+                __GZ_ERROR(_state[GZ_STATE_ERROR])
+            
+            PrintToServer("last_block: %d    block_type: %d", last_block, block_type);
+            
+            decl ret;
+            switch (block_type)
+            {
+                case GZ_BLOCK_STORED: ret = _gz_stored(_state);
+                case GZ_BLOCK_FIXED: ret = _gz_fixed(_state);
+                case GZ_BLOCK_DYNAMIC: ret = _gz_dynamic(_state);
+                default: __GZ_ERROR(GZ_ERROR_BAD_BLOCK)
+            }
+            
+            if (ret == -1)
+                __GZ_ERROR(_state[GZ_STATE_ERROR])
             
             if (last_block)
                 break;
+            current_block++;
         }
         
         current_member++;
@@ -303,12 +337,16 @@ stock GetErrorMessage(errcode, String:message[], maxlength)
             __GZ_ERRCPY("Bad member header");
         case GZ_ERROR_UNIMPLEMENTED_CM:
             __GZ_ERRCPY("Compression method not implemented");
+        case GZ_ERROR_BAD_BLOCK:
+            __GZ_ERRCPY("Bad compressed block");
         
         // Library errors
         case GZ_ERROR_INPUT_FILE_BAD:
             __GZ_ERRCPY("Could not open input file");
         case GZ_ERROR_OUTPUT_FILE_BAD:
             __GZ_ERRCPY("Could not open output file");
+        case GZ_ERROR_NOT_IMPLEMENTED:
+            __GZ_ERRCPY("Feature not implemented");
     }
     
     __GZ_ERRCPY("Not an error");
@@ -347,8 +385,7 @@ stock _gz_PrintMemberToServer(id1, id2, cm, flg, mtime, xfl, os, crc32, isize,
 #define _GZ_BITS(%1,%2) \
     %1 = _gz_bits(_state, (%2)); \
     if (%1 == -1 && _state[GZ_STATE_ERROR]) \
-        __GZ_ERROR(_state[GZ_STATE_ERROR])
-#define fixing_syntax_highlighting_in_textmate
+        return -1
 
 stock _gz_bits(_state[GZ_STATE_SIZE], need)
 {
@@ -360,7 +397,7 @@ stock _gz_bits(_state[GZ_STATE_SIZE], need)
     {
         decl byte[1];
         /* Load eight bits */
-        if (ReadFile(_state[GZ_STATE_IN], byte, 1, 1) != 1)
+        if (ReadFile(Handle:_state[GZ_STATE_IN], byte, 1, 1) != 1)
         {
             /* Out of input */
             _state[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
@@ -368,22 +405,21 @@ stock _gz_bits(_state[GZ_STATE_SIZE], need)
         }
         
         val |= byte[0] << _state[GZ_STATE_BITCNT];
-        _state[GZ_STATE_BITCNT]++;
+        _state[GZ_STATE_BITCNT] += 8;
     }
     
     /* Drop `need` bits and update buffer, always zero to seven bits left */
-    state[GZ_STATE_BITBUF] = val >> need;
-    state[GZ_STATE_BITCNT] -= need;
+    _state[GZ_STATE_BITBUF] = val >> need;
+    _state[GZ_STATE_BITCNT] -= need;
     
     /* Return `need` bits, zeroing the bits above that */
     return val & ((1 << need) - 1);
 }
 
 #define _GZ_BYTE(%1) \
-    %1 = _gz_byte(_state); \
+    %1 = _gz_byte(_state, false); \
     if (%1 == -1 && _state[GZ_STATE_ERROR]) \
-        __GZ_ERROR(_state[GZ_STATE_ERROR])
-#define fixing_syntax_highlighting_in_textmate
+        return -1
 
 stock _gz_byte(_state[GZ_STATE_SIZE], peek)
 {
@@ -391,9 +427,9 @@ stock _gz_byte(_state[GZ_STATE_SIZE], peek)
     decl loc;
     
     if (peek)
-        loc = FilePosition(_state[GZ_STATE_IN]);
+        loc = FilePosition(Handle:_state[GZ_STATE_IN]);
     
-    new ret = ReadFile(_state[GZ_STATE_IN], buf, 1, 1);
+    new ret = ReadFile(Handle:_state[GZ_STATE_IN], buf, 1, 1);
     if (ret != 1)
     {
         _state[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
@@ -403,7 +439,66 @@ stock _gz_byte(_state[GZ_STATE_SIZE], peek)
     }
     
     if (peek)
-        FileSeek(_state[GZ_STATE_IN], loc);
+        FileSeek(Handle:_state[GZ_STATE_IN], loc, SEEK_SET);
     
     return buf[0];
+}
+
+stock _gz_stored(_state[GZ_STATE_SIZE])
+{
+    decl len;   /* Length of stored block */
+    
+    /* Discard leftover bits from current byte (assumes BITCNT < 8) */
+    _state[GZ_STATE_BITBUF] = 0;
+    _state[GZ_STATE_BITCNT] = 0;
+    
+    /* Get length */
+    _GZ_BYTE(len);
+    decl _len;
+    _GZ_BYTE(_len);
+    len |= _len << 8;
+    
+    /* Check against its one's complement */
+    decl _byte1, _byte2;
+    _GZ_BYTE(_byte1);
+    _GZ_BYTE(_byte2);
+    if (_byte1 != (~len & 0xff) || _byte2 != (~_len & 0xff))
+    {
+        /* Didn't match complement! */
+        _state[GZ_STATE_ERROR] = GZ_ERROR_BAD_BLOCK;
+        return -1;
+    }
+    
+    /* Copy `len` bytes from input to output */
+    decl buffer[len];
+    decl ret;
+    if ((ret = ReadFile(Handle:_state[GZ_STATE_IN], buffer, len, 1)) != len)
+    {
+        _state[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
+        if (ret != -1)
+            /* Not enough input */
+            _state[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
+        return -1;
+    }
+    if (!WriteFile(Handle:_state[GZ_STATE_OUT], buffer, len, 1))
+    {
+        _state[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
+        return -1;
+    }
+    
+    return 0;
+}
+
+stock _gz_fixed(_state[GZ_STATE_SIZE])
+{
+    PrintToServer("fixed");
+    _state[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
+    return -1;
+}
+
+stock _gz_dynamic(_state[GZ_STATE_SIZE])
+{
+    PrintToServer("dynamic");
+    _state[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
+    return -1;
 }
