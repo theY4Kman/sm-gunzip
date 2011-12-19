@@ -500,65 +500,6 @@ stock _gz_byte_get(GZ_STATE_DEF, loc, seek)
     return buf[0];
 }
 
-stock _gz_stored(GZ_STATE_DEF)
-{
-    decl len;   /* Length of stored block */
-    
-    /* Discard leftover bits from current byte (assumes BITCNT < 8) */
-    GZ_STATE[GZ_STATE_BITBUF] = 0;
-    GZ_STATE[GZ_STATE_BITCNT] = 0;
-    
-    /* Get length */
-    _GZ_BYTE(len);
-    decl _len;
-    _GZ_BYTE(_len);
-    len |= _len << 8;
-    
-    /* Check against its one's complement */
-    decl _byte1, _byte2;
-    _GZ_BYTE(_byte1);
-    _GZ_BYTE(_byte2);
-    if (_byte1 != (~len & 0xff) || _byte2 != (~_len & 0xff))
-    {
-        /* Didn't match complement! */
-        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_BAD_BLOCK;
-        return -1;
-    }
-    
-    /* Copy `len` bytes from input to output */
-    decl buffer[len];
-    decl ret;
-    if ((ret = ReadFile(Handle:GZ_STATE[GZ_STATE_IN], buffer, len, 1)) != len)
-    {
-        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
-        if (ret != -1)
-            /* Not enough input */
-            GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
-        return -1;
-    }
-    if (!WriteFile(Handle:GZ_STATE[GZ_STATE_OUT], buffer, len, 1))
-    {
-        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
-        return -1;
-    }
-    
-    return 0;
-}
-
-stock _gz_fixed(GZ_STATE_DEF)
-{
-    PrintToServer("fixed");
-    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
-    return -1;
-}
-
-stock _gz_dynamic(GZ_STATE_DEF)
-{
-    PrintToServer("dynamic");
-    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
-    return -1;
-}
-
 #define SLOW // FOR DEBUGGING PURPOSES ONLY
 #if defined(SLOW)
 stock _gz_decode(GZ_STATE_DEF, GZ_HUFF_DEF)
@@ -612,7 +553,7 @@ stock _gz_construct(GZ_HUFF_DEF, length[], n)
     
     /* Check for an over-subscribed or incomplete set of lengths */
     left = 1;                           /* one possible code of zero length */
-    for (len = 1; len <= MAXBITS; len++)
+    for (len = 1; len <= GZ_MAXBITS; len++)
     {
         left <<= 1;                     /* one more bit, double codes left */
         left -= GZ_HUFF_COUNT[len];     /* deduct count from possible codes */
@@ -670,7 +611,9 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
         if (symbol < 0) return symbol;      /* invalid symbol */
         if (symbol < 256) {                 /* literal: symbol is the byte */
             /* write out the literal */
-            if (WriteFile(GZ_STATE[GZ_STATE_OUT], { symbol }, 1, 1) == -1) {
+            decl b[1];
+            b[0] = symbol;
+            if (!WriteFile(Handle:GZ_STATE[GZ_STATE_OUT], b, 1, 1)) {
                 GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
                 return -1;
             }
@@ -684,22 +627,21 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
             }
             
             decl bits;
-            _GZ_BITS(bits,lext[symbol])
+            _GZ_BITS(bits,lext[symbol]);
             len = lens[symbol] + bits;
             
             /* get and check distance */
             symbol = _gz_decode(GZ_STATE, GZ_HUFF_DIST_COUNT,
-                                GZ_HUFF_DIST_SYMBOL)
+                                GZ_HUFF_DIST_SYMBOL);
             if (symbol < 0) return symbol;  /* invalid symbol */
-            _GZ_BITS(bits, dext[symbol])
+            _GZ_BITS(bits, dext[symbol]);
             dist = dists[symbol] + bits;
             
             /* copy length bytes from distance bytes back */
             while (len--) {
-                decl byte;
-                GZ_BYTE_GET(byte,-dist,SEEK_CUR);
-                
-                if (WriteFile(GZ_STATE[GZ_STATE_OUT], { byte }, 1, 1) == -1) {
+                decl byte[1];
+                _GZ_BYTE_GET(byte[0],-dist,SEEK_CUR);
+                if (!WriteFile(Handle:GZ_STATE[GZ_STATE_OUT], byte, 1, 1)) {
                     GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
                     return -1;
                 }
@@ -709,4 +651,90 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
     
     /* done with a valid fixed or dynamic block */
     return 0;
+}
+
+stock _gz_stored(GZ_STATE_DEF)
+{
+    decl len;   /* Length of stored block */
+
+    /* Discard leftover bits from current byte (assumes BITCNT < 8) */
+    GZ_STATE[GZ_STATE_BITBUF] = 0;
+    GZ_STATE[GZ_STATE_BITCNT] = 0;
+
+    /* Get length */
+    _GZ_BYTE(len);
+    decl _len;
+    _GZ_BYTE(_len);
+    len |= _len << 8;
+
+    /* Check against its one's complement */
+    decl _byte1, _byte2;
+    _GZ_BYTE(_byte1);
+    _GZ_BYTE(_byte2);
+    if (_byte1 != (~len & 0xff) || _byte2 != (~_len & 0xff))
+    {
+        /* Didn't match complement! */
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_BAD_BLOCK;
+        return -1;
+    }
+
+    /* Copy `len` bytes from input to output */
+    decl buffer[len];
+    decl ret;
+    if ((ret = ReadFile(Handle:GZ_STATE[GZ_STATE_IN], buffer, len, 1)) != len)
+    {
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
+        if (ret != -1)
+            /* Not enough input */
+            GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
+        return -1;
+    }
+    if (!WriteFile(Handle:GZ_STATE[GZ_STATE_OUT], buffer, len, 1))
+    {
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
+        return -1;
+    }
+
+    return 0;
+}
+
+stock _gz_fixed(GZ_STATE_DEF)
+{
+    static virgin = 1;
+    static lencnt[GZ_MAXBITS + 1], lensym[GZ_FIXLCODES];
+    static distcnt[GZ_MAXBITS + 1], distsym[GZ_MAXDCODES];
+    
+    if (virgin) {
+        decl symbol;
+        decl lengths[GZ_FIXLCODES];
+        
+        /* literal/length table */
+        for (symbol = 0; symbol < 144; symbol++)
+            lengths[symbol] = 8;
+        for (; symbol < 256; symbol++)
+            lengths[symbol] = 9;
+        for (; symbol < 280; symbol++)
+            lengths[symbol] = 7;
+        for (; symbol < GZ_FIXLCODES; symbol++)
+            lengths[symbol] = 8;
+        _gz_construct(lencnt, lensym, lengths, GZ_FIXLCODES);
+        
+        /* distance table */
+        for (symbol = 0; symbol < GZ_MAXDCODES; symbol++)
+            lengths[symbol] = 5;
+        _gz_construct(distcnt, distsym, lengths, GZ_MAXDCODES);
+        
+        /* do this just once */
+        virgin = 0;
+    }
+    
+    /* decode data until end-of-block code */
+    return _gz_codes(GZ_STATE, lencnt, lensym, distcnt, distsym);
+}
+
+stock _gz_dynamic(GZ_STATE_DEF)
+{
+    PrintToServer("dynamic");
+    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
+    return -1;
 }
