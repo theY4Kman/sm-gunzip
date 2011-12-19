@@ -72,7 +72,7 @@
 #define GZ_MAXBITS      15          /* max bits in a code */
 #define GZ_MAXLCODES    286         /* max number of literal/length codes */
 #define GZ_MAXDCODES    30          /* max number of distance codes */
-#define GZ_MAXCODES     (MAXLCODES+MAXDCODES)   /* max codes lengths to read */
+#define GZ_MAXCODES     (GZ_MAXLCODES+GZ_MAXDCODES)
 #define GZ_FIXLCODES    288         /* number of fixed literal/length codes */
 
 
@@ -113,6 +113,11 @@
 // 1000-1999: INFLATE-related errors
 #define GZ_ERROR_HUFF_OUT_OF_CODES      1000
 #define GZ_ERROR_INVALID_FIXED_CODE     1001
+#define GZ_ERROR_HUFF_BAD_COUNTS        1002
+#define GZ_ERROR_REQUIRE_COMPLETE_SET   1003
+#define GZ_ERROR_TOO_MANY_LENGTHS       1004
+#define GZ_ERROR_NO_END_OF_BLOCK_CODE   1005
+#define GZ_ERROR_INCOMPLETE_ONLY_ONE    1006
 
 // >= 9000: library errors
 #define GZ_ERROR_END_OF_FILE            9000
@@ -365,8 +370,20 @@ stock GetErrorMessage(errcode, String:message[], maxlength)
             __GZ_ERRCPY("Huffman decode: ran out of codes");
         case GZ_ERROR_INVALID_FIXED_CODE:
             __GZ_ERRCPY("Invalid fixed code");
+        case GZ_ERROR_HUFF_BAD_COUNTS:
+            __GZ_ERRCPY("Bad counts in dynamic block");
+        case GZ_ERROR_REQUIRE_COMPLETE_SET:
+            __GZ_ERRCPY("Require complete code set");
+        case GZ_ERROR_TOO_MANY_LENGTHS:
+            __GZ_ERRCPY("Too many lengths");
+        case GZ_ERROR_NO_END_OF_BLOCK_CODE:
+            __GZ_ERRCPY("No end-of-block code");
+        case GZ_ERROR_INCOMPLETE_ONLY_ONE:
+            __GZ_ERRCPY("Incomplete codes only allowed if just one code");
         
         // Library errors
+        case GZ_ERROR_END_OF_FILE:
+            __GZ_ERRCPY("EOF reached unexpectedly");
         case GZ_ERROR_INPUT_FILE_BAD:
             __GZ_ERRCPY("Could not open input file");
         case GZ_ERROR_OUTPUT_FILE_BAD:
@@ -608,6 +625,8 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
     /* decode literals and length/distance pairs */
     do {
         symbol = _gz_decode(GZ_STATE, GZ_HUFF_LEN_COUNT, GZ_HUFF_LEN_SYMBOL);
+        if (symbol == -1 && GZ_STATE[GZ_STATE_ERROR])
+            return -1;
         if (symbol < 0) return symbol;      /* invalid symbol */
         if (symbol < 256) {                 /* literal: symbol is the byte */
             /* write out the literal */
@@ -633,6 +652,8 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
             /* get and check distance */
             symbol = _gz_decode(GZ_STATE, GZ_HUFF_DIST_COUNT,
                                 GZ_HUFF_DIST_SYMBOL);
+            if (symbol == -1 && GZ_STATE[GZ_STATE_ERROR])
+                return -1;
             if (symbol < 0) return symbol;  /* invalid symbol */
             _GZ_BITS(bits, dext[symbol]);
             dist = dists[symbol] + bits;
@@ -640,6 +661,8 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
             /* copy length bytes from distance bytes back */
             while (len--) {
                 decl byte[1];
+                /////////////////////////////////////////////////////////////////
+                PrintToServer("pos: %d", FilePosition(Handle:GZ_STATE[GZ_STATE_IN]));
                 _GZ_BYTE_GET(byte[0],-dist,SEEK_CUR);
                 if (!WriteFile(Handle:GZ_STATE[GZ_STATE_OUT], byte, 1, 1)) {
                     GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
@@ -717,12 +740,16 @@ stock _gz_fixed(GZ_STATE_DEF)
             lengths[symbol] = 7;
         for (; symbol < GZ_FIXLCODES; symbol++)
             lengths[symbol] = 8;
-        _gz_construct(lencnt, lensym, lengths, GZ_FIXLCODES);
+        if (_gz_construct(lencnt, lensym, lengths, GZ_FIXLCODES) == -1
+            && GZ_STATE[GZ_STATE_ERROR])
+            return -1;
         
         /* distance table */
         for (symbol = 0; symbol < GZ_MAXDCODES; symbol++)
             lengths[symbol] = 5;
-        _gz_construct(distcnt, distsym, lengths, GZ_MAXDCODES);
+        if (_gz_construct(distcnt, distsym, lengths, GZ_MAXDCODES) == -1
+            && GZ_STATE[GZ_STATE_ERROR])
+            return -1;
         
         /* do this just once */
         virgin = 0;
@@ -734,7 +761,113 @@ stock _gz_fixed(GZ_STATE_DEF)
 
 stock _gz_dynamic(GZ_STATE_DEF)
 {
-    PrintToServer("dynamic");
-    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
-    return -1;
+    decl bits;                          /* buffer for _GZ_BITS calls */
+    decl nlen, ndist, ncode;            /* number of lengths in descriptor */
+    decl index;                         /* index of lengths[] */
+    decl err;                           /* construct() return value */
+    decl lengths[GZ_MAXCODES];          /* descriptor code lengths */
+    decl lencnt[GZ_MAXBITS+1], lensym[GZ_MAXLCODES];    /* lencode memory */
+    decl distcnt[GZ_MAXBITS+1], distsym[GZ_MAXDCODES];  /* distcode memory */
+    decl order[19] =                    /* permutation of code length codes */
+        { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+    
+    /* get number of lengths in each table */
+    _GZ_BITS(bits,5);
+    nlen = bits + 257;
+    _GZ_BITS(bits,5);
+    ndist = bits + 1;
+    _GZ_BITS(bits,4);
+    ncode = bits + 4;
+    
+    /* check lengths */
+    if (nlen > GZ_MAXLCODES || ndist > GZ_MAXDCODES) {
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_HUFF_BAD_COUNTS;
+        return -1;
+    }
+    
+    /* read code length code lengths (really), missing lengths are zero */
+    for (index = 0; index < ncode; index++) {
+        _GZ_BITS(bits,3);
+        lengths[order[index]] = bits;
+    }
+    for (; index < 19; index++)
+        lengths[order[index]] = 0;
+    
+    /* build huffman table for code lengths codes (use lencnt/sym
+     * temporarily)
+     */
+    err = _gz_construct(lencnt, lensym, lengths, 19);
+    if (err == -1 && GZ_STATE[GZ_STATE_ERROR])
+        return -1;
+    else if (err != 0) {
+        /* require complete code set here */
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_REQUIRE_COMPLETE_SET;
+        return -1;
+    }
+    
+    /* read length/literal and distance code length tables */
+    index = 0;
+    while (index < nlen + ndist) {
+        decl symbol;            /* decoded value */
+        decl len;               /* last length to repeat */
+        
+        symbol = _gz_decode(GZ_STATE, lencnt, lensym);
+        if (symbol == -1 && GZ_STATE[GZ_STATE_ERROR])
+            return -1;
+        else if (symbol < 16)           /* length in 0..15 */
+            lengths[index++] = symbol;
+        else {                          /* repeat instruction */
+            len = 0;                    /* assume repeating zeros */
+            if (symbol == 16) {         /* repeat last length 3..6 times */
+                if (index == 0) return -5;      /* no last length! */
+                len = lengths[index - 1];       /* last length */
+                
+                _GZ_BITS(bits,2);
+                symbol = 3 + bits;
+            }
+            else if (symbol == 17) {    /* repeat zero 3..10 times */
+                _GZ_BITS(bits,3);
+                symbol = 3 + bits;
+            }
+            else {                      /* == 18, repeat zero 11..138 times */
+                _GZ_BITS(bits,7);
+                symbol = 11 + bits;
+            }
+            
+            if (index + symbol > nlen + ndist) {
+                GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_TOO_MANY_LENGTHS;
+                return -1;              /* too many lengths! */
+            }
+            
+            while (symbol--)            /* repeat last or zero symbol times */
+                lengths[index++] = len;
+        }
+    }    
+    
+    /* check for end-of-block code -- there better be one! */
+    if (lengths[256] == 0) {
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_NO_END_OF_BLOCK_CODE;
+        return -1;
+    }
+
+    /* build huffman table for literal/length codes */
+    err = _gz_construct(lencnt, lensym, lengths, nlen);
+    if (err == -1 && GZ_STATE[GZ_STATE_ERROR])
+        return -1;
+    if (err < 0 || (err > 0 && nlen - lencnt[0] != 1)) {
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INCOMPLETE_ONLY_ONE;
+        return -1;      /* only allow incomplete codes if just one code */
+    }
+
+    /* build huffman table for distance codes */
+    err = _gz_construct(distcnt, distsym, lengths[nlen], ndist);
+    if (err == -1 && GZ_STATE[GZ_STATE_ERROR])
+        return -1;
+    if (err < 0 || (err > 0 && ndist - distcnt[0] != 1)) {
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INCOMPLETE_ONLY_ONE;
+        return -1;      /* only allow incomplete codes if just one code */
+    }
+    
+    /* decode data until end-of-block code */
+    return _gz_codes(GZ_STATE, lencnt, lensym, distcnt, distsym);
 }
