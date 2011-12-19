@@ -21,7 +21,7 @@
 
 
 // =============================================================================
-//  Gzip header defines
+//  Gzip member header defines
 // =============================================================================
 
 #define GZ_ID1  0x1f    // Magic
@@ -57,12 +57,23 @@
 #define GZ_OS_ACORN         13  // Acorn RISCOS
 #define GZ_OS_UNKNOWN       255 // Unknown
 
+
+// =============================================================================
+//  INFLATE-related defines
+// =============================================================================
+
 #define GZ_LAST_BLOCK       1
 
 #define GZ_BLOCK_STORED     0
 #define GZ_BLOCK_FIXED      1
 #define GZ_BLOCK_DYNAMIC    2
 #define GZ_BLOCK_RESERVED   3
+
+#define GZ_MAXBITS      15          /* max bits in a code */
+#define GZ_MAXLCODES    286         /* max number of literal/length codes */
+#define GZ_MAXDCODES    30          /* max number of distance codes */
+#define GZ_MAXCODES     (MAXLCODES+MAXDCODES)   /* max codes lengths to read */
+#define GZ_FIXLCODES    288         /* number of fixed literal/length codes */
 
 
 // =============================================================================
@@ -80,6 +91,13 @@
 
 #define GZ_FLAG(%1,%2) (((%1) & (%2)) == (%2))
 
+#define GZ_STATE        _state
+#define GZ_STATE_DEF    GZ_STATE[GZ_STATE_SIZE]
+
+#define GZ_HUFF_COUNT   huff_count
+#define GZ_HUFF_SYMBOL  huff_symbol
+#define GZ_HUFF_DEF     GZ_HUFF_COUNT[], GZ_HUFF_SYMBOL[]
+
 
 // =============================================================================
 //  Error codes (see GetErrorMessage for messages)
@@ -91,6 +109,10 @@
 #define GZ_ERROR_BAD_MEMBER_HEADER      0001
 #define GZ_ERROR_UNIMPLEMENTED_CM       0002
 #define GZ_ERROR_BAD_BLOCK              0003
+
+// 1000-1999: INFLATE-related errors
+#define GZ_ERROR_HUFF_OUT_OF_CODES      1000
+#define GZ_ERROR_INVALID_FIXED_CODE     1001
 
 // >= 9000: library errors
 #define GZ_ERROR_END_OF_FILE            9000
@@ -145,9 +167,9 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
             return -1; \
         }
 
-        new _state[GZ_STATE_SIZE];
-        _state[GZ_STATE_IN] = _:gzfp;
-        _state[GZ_STATE_ERROR] = GZ_ERROR_SUCCESS;
+        new GZ_STATE_DEF;
+        GZ_STATE[GZ_STATE_IN] = _:gzfp;
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_SUCCESS;
         
         // Member header declarations
         new member_id1      = 0,
@@ -254,13 +276,13 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
             new len = strlen(out_file) + 12;
             decl String:inc_fname[len];
             Format(inc_fname, len, "%s.%d", out_file, current_member);
-            _state[GZ_STATE_OUT] = _:OpenFile(inc_fname, "wb");
+            GZ_STATE[GZ_STATE_OUT] = _:OpenFile(inc_fname, "wb");
         }
         else
-            _state[GZ_STATE_OUT] = _:OpenFile(out_file, "wb");
+            GZ_STATE[GZ_STATE_OUT] = _:OpenFile(out_file, "wb");
         
         // Make sure we can write to the output file
-        if (Handle:_state[GZ_STATE_OUT] == INVALID_HANDLE)
+        if (Handle:GZ_STATE[GZ_STATE_OUT] == INVALID_HANDLE)
             __GZ_ERROR(GZ_ERROR_OUTPUT_FILE_BAD)
         
         // Loop through all the compressed blocks
@@ -280,14 +302,12 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
             }
             
             new last_block = _gz_bits(_state, 1);
-            if (last_block == -1 && _state[GZ_STATE_ERROR])
-                __GZ_ERROR(_state[GZ_STATE_ERROR])
+            if (last_block == -1 && GZ_STATE[GZ_STATE_ERROR])
+                __GZ_ERROR(GZ_STATE[GZ_STATE_ERROR])
                         
             new block_type = _gz_bits(_state, 2);
             if (block_type == -1 && _state[GZ_STATE_ERROR])
-                __GZ_ERROR(_state[GZ_STATE_ERROR])
-            
-            PrintToServer("last_block: %d    block_type: %d", last_block, block_type);
+                __GZ_ERROR(GZ_STATE[GZ_STATE_ERROR])
             
             decl ret;
             switch (block_type)
@@ -299,7 +319,7 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
             }
             
             if (ret == -1)
-                __GZ_ERROR(_state[GZ_STATE_ERROR])
+                __GZ_ERROR(GZ_STATE[GZ_STATE_ERROR])
             
             if (last_block)
                 break;
@@ -340,6 +360,12 @@ stock GetErrorMessage(errcode, String:message[], maxlength)
         case GZ_ERROR_BAD_BLOCK:
             __GZ_ERRCPY("Bad compressed block");
         
+        // INFLATE-related errors
+        case GZ_ERROR_HUFF_OUT_OF_CODES:
+            __GZ_ERRCPY("Huffman decode: ran out of codes");
+        case GZ_ERROR_INVALID_FIXED_CODE:
+            __GZ_ERRCPY("Invalid fixed code");
+        
         // Library errors
         case GZ_ERROR_INPUT_FILE_BAD:
             __GZ_ERRCPY("Could not open input file");
@@ -354,7 +380,7 @@ stock GetErrorMessage(errcode, String:message[], maxlength)
 
 
 // =============================================================================
-//  Library-use functions, forward compatability not guaranteed whatsoever
+//  Internal library-use functions, forward compatability not guaranteed 
 // =============================================================================
 
 stock _gz_PrintMemberToServer(id1, id2, cm, flg, mtime, xfl, os, crc32, isize,
@@ -384,33 +410,33 @@ stock _gz_PrintMemberToServer(id1, id2, cm, flg, mtime, xfl, os, crc32, isize,
 
 #define _GZ_BITS(%1,%2) \
     %1 = _gz_bits(_state, (%2)); \
-    if (%1 == -1 && _state[GZ_STATE_ERROR]) \
+    if (%1 == -1 && GZ_STATE[GZ_STATE_ERROR]) \
         return -1
 
-stock _gz_bits(_state[GZ_STATE_SIZE], need)
+stock _gz_bits(GZ_STATE_DEF, need)
 {
     decl val;
     
     // Load at least `need` bits into val
-    val = _state[GZ_STATE_BITBUF];
-    while (_state[GZ_STATE_BITCNT] < need)
+    val = GZ_STATE[GZ_STATE_BITBUF];
+    while (GZ_STATE[GZ_STATE_BITCNT] < need)
     {
         decl byte[1];
         /* Load eight bits */
-        if (ReadFile(Handle:_state[GZ_STATE_IN], byte, 1, 1) != 1)
+        if (ReadFile(Handle:GZ_STATE[GZ_STATE_IN], byte, 1, 1) != 1)
         {
             /* Out of input */
-            _state[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
+            GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
             return -1;
         }
         
-        val |= byte[0] << _state[GZ_STATE_BITCNT];
-        _state[GZ_STATE_BITCNT] += 8;
+        val |= byte[0] << GZ_STATE[GZ_STATE_BITCNT];
+        GZ_STATE[GZ_STATE_BITCNT] += 8;
     }
     
     /* Drop `need` bits and update buffer, always zero to seven bits left */
-    _state[GZ_STATE_BITBUF] = val >> need;
-    _state[GZ_STATE_BITCNT] -= need;
+    GZ_STATE[GZ_STATE_BITBUF] = val >> need;
+    GZ_STATE[GZ_STATE_BITCNT] -= need;
     
     /* Return `need` bits, zeroing the bits above that */
     return val & ((1 << need) - 1);
@@ -421,36 +447,66 @@ stock _gz_bits(_state[GZ_STATE_SIZE], need)
     if (%1 == -1 && _state[GZ_STATE_ERROR]) \
         return -1
 
-stock _gz_byte(_state[GZ_STATE_SIZE], peek)
+#define _GZ_BYTE_PEEK(%1) \
+    %1 = _gz_byte(_state, true); \
+    if (%1 == -1 && _state[GZ_STATE_ERROR]) \
+        return -1
+
+stock _gz_byte(GZ_STATE_DEF, peek)
 {
     decl buf[1];
     decl loc;
     
     if (peek)
-        loc = FilePosition(Handle:_state[GZ_STATE_IN]);
+        loc = FilePosition(Handle:GZ_STATE[GZ_STATE_IN]);
     
-    new ret = ReadFile(Handle:_state[GZ_STATE_IN], buf, 1, 1);
+    new ret = ReadFile(Handle:GZ_STATE[GZ_STATE_IN], buf, 1, 1);
     if (ret != 1)
     {
-        _state[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
         if (ret != -1)
-            _state[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
+            GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
         return -1;
     }
     
     if (peek)
-        FileSeek(Handle:_state[GZ_STATE_IN], loc, SEEK_SET);
+        FileSeek(Handle:GZ_STATE[GZ_STATE_IN], loc, SEEK_SET);
     
+    return buf[0];
+} 
+
+#define _GZ_BYTE_GET(%1,%2,%3) \
+    %1 = _gz_byte_get(_state, (%2), (%3)); \
+    if (%1 == -1 && _state[GZ_STATE_ERROR]) \
+        return -1
+
+stock _gz_byte_get(GZ_STATE_DEF, loc, seek)
+{
+    decl buf[1];
+    
+    new orig_loc = FilePosition(Handle:GZ_STATE[GZ_STATE_IN]);
+    FileSeek(Handle:GZ_STATE[GZ_STATE_IN], loc, seek);
+
+    new ret = ReadFile(Handle:GZ_STATE[GZ_STATE_IN], buf, 1, 1);
+    if (ret != 1)
+    {
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
+        if (ret != -1)
+            GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
+        return -1;
+    }
+
+    FileSeek(Handle:GZ_STATE[GZ_STATE_IN], orig_loc, SEEK_SET);
     return buf[0];
 }
 
-stock _gz_stored(_state[GZ_STATE_SIZE])
+stock _gz_stored(GZ_STATE_DEF)
 {
     decl len;   /* Length of stored block */
     
     /* Discard leftover bits from current byte (assumes BITCNT < 8) */
-    _state[GZ_STATE_BITBUF] = 0;
-    _state[GZ_STATE_BITCNT] = 0;
+    GZ_STATE[GZ_STATE_BITBUF] = 0;
+    GZ_STATE[GZ_STATE_BITCNT] = 0;
     
     /* Get length */
     _GZ_BYTE(len);
@@ -465,40 +521,192 @@ stock _gz_stored(_state[GZ_STATE_SIZE])
     if (_byte1 != (~len & 0xff) || _byte2 != (~_len & 0xff))
     {
         /* Didn't match complement! */
-        _state[GZ_STATE_ERROR] = GZ_ERROR_BAD_BLOCK;
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_BAD_BLOCK;
         return -1;
     }
     
     /* Copy `len` bytes from input to output */
     decl buffer[len];
     decl ret;
-    if ((ret = ReadFile(Handle:_state[GZ_STATE_IN], buffer, len, 1)) != len)
+    if ((ret = ReadFile(Handle:GZ_STATE[GZ_STATE_IN], buffer, len, 1)) != len)
     {
-        _state[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
         if (ret != -1)
             /* Not enough input */
-            _state[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
+            GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
         return -1;
     }
-    if (!WriteFile(Handle:_state[GZ_STATE_OUT], buffer, len, 1))
+    if (!WriteFile(Handle:GZ_STATE[GZ_STATE_OUT], buffer, len, 1))
     {
-        _state[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
+        GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
         return -1;
     }
     
     return 0;
 }
 
-stock _gz_fixed(_state[GZ_STATE_SIZE])
+stock _gz_fixed(GZ_STATE_DEF)
 {
     PrintToServer("fixed");
-    _state[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
+    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
     return -1;
 }
 
-stock _gz_dynamic(_state[GZ_STATE_SIZE])
+stock _gz_dynamic(GZ_STATE_DEF)
 {
     PrintToServer("dynamic");
-    _state[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
+    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_NOT_IMPLEMENTED;
     return -1;
+}
+
+#define SLOW // FOR DEBUGGING PURPOSES ONLY
+#if defined(SLOW)
+stock _gz_decode(GZ_STATE_DEF, GZ_HUFF_DEF)
+{
+    decl len,   /* current number of bits in code */
+         count; /* number of codes of length `len` */
+    new  code,  /* `len` bits being decoded */
+         first, /* first code of length `len` */
+         index; /* index of first code of length `len` in symbol table */
+    
+    for (len=1; len <= GZ_MAXBITS; len++)
+    {
+        decl bits;
+        _GZ_BITS(bits,1);
+        
+        /* get next bit */
+        code |= bits;
+        count = GZ_HUFF_COUNT[len];
+        
+        /* if length `len`, return symbol */
+        if (code - count < first)
+            return GZ_HUFF_SYMBOL[index + (code - first)];
+        
+        index += count;
+        first += count;
+        first <<= 1;
+        code <<= 1;
+    }
+    
+    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_HUFF_OUT_OF_CODES;
+    return -1;
+}
+#endif
+
+stock _gz_construct(GZ_HUFF_DEF, length[], n)
+{
+    decl symbol;    /* current symbol when stepping through length[] */
+    decl len;       /* current length when stepping through GZ_HUFF_COUNT */
+    decl left;      /* number of possible codes left of current length */
+    decl offs[GZ_MAXBITS + 1];  /* offsets in symbol table for each length */
+    
+    /* count number of codes of each length */
+    for (len = 0; len <= GZ_MAXBITS; len++)
+        GZ_HUFF_COUNT[len] = 0;
+    for (symbol = 0; symbol < n; symbol++)
+        (GZ_HUFF_COUNT[length[symbol]])++; // assumes lengths are within bounds
+    
+    /* No codes!*/
+    if (GZ_HUFF_COUNT[0] == n)
+        return 0;                   /* complete, but _gz_decode() will fail */
+    
+    /* Check for an over-subscribed or incomplete set of lengths */
+    left = 1;                           /* one possible code of zero length */
+    for (len = 1; len <= MAXBITS; len++)
+    {
+        left <<= 1;                     /* one more bit, double codes left */
+        left -= GZ_HUFF_COUNT[len];     /* deduct count from possible codes */
+        if (left < 0) return left;      /* over-subscribed--return negative */
+    }                                   /* left > 0 means incomplete */
+    
+    /* generate offsets into symbol table for each length for sorting */
+    offs[1] = 0;
+    for (len = 1; len < GZ_MAXBITS; len++)
+        offs[len + 1] = offs[len] + GZ_HUFF_COUNT[len];
+    
+    /* put symbols in table sorted by length, by symbol order within each
+     * length
+     */
+    for (symbol = 0; symbol < n; symbol++)
+        if (length[symbol] != 0)
+            GZ_HUFF_SYMBOL[offs[length[symbol]]++] = symbol;
+    
+    /* return zero for complete set, positive for incomplete set */
+    return left;
+}
+
+/* represents two huffman struct { short *count; short *symbol; } */
+#define GZ_HUFF_LEN_COUNT       huff_len_count
+#define GZ_HUFF_LEN_SYMBOL      huff_len_symbol
+#define GZ_HUFF_LEN_DEF         GZ_HUFF_LEN_COUNT[], GZ_HUFF_LEN_SYMBOL[]
+
+#define GZ_HUFF_DIST_COUNT      huff_dist_count
+#define GZ_HUFF_DIST_SYMBOL     huff_dist_symbol
+#define GZ_HUFF_DIST_DEF        GZ_HUFF_DIST_COUNT[], GZ_HUFF_DIST_SYMBOL[]
+
+stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
+{
+    decl symbol;        /* decoded symbol */
+    decl len;           /* length for copy */
+    decl dist;          /* distance for copy */
+    static lens[29] = { /* Size base for length codes 257..285 */
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+    static lext[29] = { /* Extra bits for length codes 257..285 */
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+    static dists[30] = { /* Offset base for distance codes 0..29 */
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+        8193, 12289, 16385, 24577 };
+    static dext[30] = { /* Extra bits for distance codes 0..29 */
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+        7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+        12, 12, 13, 13 };
+    
+    /* decode literals and length/distance pairs */
+    do {
+        symbol = _gz_decode(GZ_STATE, GZ_HUFF_LEN_COUNT, GZ_HUFF_LEN_SYMBOL);
+        if (symbol < 0) return symbol;      /* invalid symbol */
+        if (symbol < 256) {                 /* literal: symbol is the byte */
+            /* write out the literal */
+            if (WriteFile(GZ_STATE[GZ_STATE_OUT], { symbol }, 1, 1) == -1) {
+                GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
+                return -1;
+            }
+        }
+        else if (symbol > 256) {            /* length */
+            /* get and compute length */
+            symbol -= 257;
+            if (symbol >= 29) {             /* invalid fixed code */
+                GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INVALID_FIXED_CODE;
+                return -1;
+            }
+            
+            decl bits;
+            _GZ_BITS(bits,lext[symbol])
+            len = lens[symbol] + bits;
+            
+            /* get and check distance */
+            symbol = _gz_decode(GZ_STATE, GZ_HUFF_DIST_COUNT,
+                                GZ_HUFF_DIST_SYMBOL)
+            if (symbol < 0) return symbol;  /* invalid symbol */
+            _GZ_BITS(bits, dext[symbol])
+            dist = dists[symbol] + bits;
+            
+            /* copy length bytes from distance bytes back */
+            while (len--) {
+                decl byte;
+                GZ_BYTE_GET(byte,-dist,SEEK_CUR);
+                
+                if (WriteFile(GZ_STATE[GZ_STATE_OUT], { byte }, 1, 1) == -1) {
+                    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
+                    return -1;
+                }
+            }
+        }
+    } while (symbol != 256);
+    
+    /* done with a valid fixed or dynamic block */
+    return 0;
 }
