@@ -27,7 +27,11 @@
 #define GZ_ID1  0x1f    // Magic
 #define GZ_ID2  0x8b    // Number
 
-#define GZ_CM_DEFLATE   8   // The DEFLATE compression method
+#define GZ_CM_STORED        0
+#define GZ_CM_COMPRESSED    1
+#define GZ_CM_PACKED        2
+#define GZ_CM_LZHED         3
+#define GZ_CM_DEFLATE       8   // The DEFLATE compression method
 
 #define GZ_FLG_FTEXT        (1<<0)  // File is probably ASCII text
 #define GZ_FLG_FHCRC        (1<<1)  // A CRC16 of the gzip header is present
@@ -118,6 +122,7 @@
 #define GZ_ERROR_TOO_MANY_LENGTHS       1004
 #define GZ_ERROR_NO_END_OF_BLOCK_CODE   1005
 #define GZ_ERROR_INCOMPLETE_ONLY_ONE    1006
+#define GZ_ERROR_NO_LAST_LENGTH         1007
 
 // >= 9000: library errors
 #define GZ_ERROR_END_OF_FILE            9000
@@ -164,6 +169,7 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
     {
         #define __GZ_ERROR(%1) \
         { \
+            if (current_member != 0) break; \
             errcode = %1; \
             GetErrorMessage(%1, error, maxlength); \
             Format(error, maxlength, "%s in member %d", error, \
@@ -303,6 +309,7 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
                 Format(error, maxlength, "%s in member %d, block %d", error, \
                        current_member, current_block); \
                 CloseHandle(gzfp); \
+                CloseHandle(Handle:GZ_STATE[GZ_STATE_OUT]); \
                 return -1; \
             }
             
@@ -326,10 +333,22 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
             if (ret == -1)
                 __GZ_ERROR(GZ_STATE[GZ_STATE_ERROR])
             
+            CloseHandle(Handle:GZ_STATE[GZ_STATE_OUT]);
+            
             if (last_block)
                 break;
             current_block++;
         }
+
+        // Read in the crc32 of the uncompressed member data
+        if (ReadFile(gzfp, membuf, 1, 4) != 1)
+            __GZ_ERROR(GZ_ERROR_BAD_MEMBER_HEADER)
+        member_crc32 = membuf[0];
+
+        // Read in the size of the uncompressed member data
+        if (ReadFile(gzfp, membuf, 1, 4) != 1)
+            __GZ_ERROR(GZ_ERROR_BAD_MEMBER_HEADER)
+        member_isize = membuf[0];
         
         current_member++;
     }
@@ -352,44 +371,31 @@ stock ExtractGzipFile(const String:gzipped_file[], const String:out_file[],
 stock GetErrorMessage(errcode, String:message[], maxlength)
 {
     #define __GZ_ERRCPY(%1) return strcopy(message, maxlength, %1)
+    #define GZERR(%1,%2) case (%1): __GZ_ERRCPY(%2)
     switch (errcode)
     {
-        case GZ_ERROR_SUCCESS:
-            __GZ_ERRCPY("Success");
+        GZERR(GZ_ERROR_SUCCESS,"Success");
         
         // Gzip errors
-        case GZ_ERROR_BAD_MEMBER_HEADER:
-            __GZ_ERRCPY("Bad member header");
-        case GZ_ERROR_UNIMPLEMENTED_CM:
-            __GZ_ERRCPY("Compression method not implemented");
-        case GZ_ERROR_BAD_BLOCK:
-            __GZ_ERRCPY("Bad compressed block");
+        GZERR(GZ_ERROR_BAD_MEMBER_HEADER,"Bad member header");
+        GZERR(GZ_ERROR_UNIMPLEMENTED_CM,"Compression method not implemented");
+        GZERR(GZ_ERROR_BAD_BLOCK,"Bad compressed block");
         
         // INFLATE-related errors
-        case GZ_ERROR_HUFF_OUT_OF_CODES:
-            __GZ_ERRCPY("Huffman decode: ran out of codes");
-        case GZ_ERROR_INVALID_FIXED_CODE:
-            __GZ_ERRCPY("Invalid fixed code");
-        case GZ_ERROR_HUFF_BAD_COUNTS:
-            __GZ_ERRCPY("Bad counts in dynamic block");
-        case GZ_ERROR_REQUIRE_COMPLETE_SET:
-            __GZ_ERRCPY("Require complete code set");
-        case GZ_ERROR_TOO_MANY_LENGTHS:
-            __GZ_ERRCPY("Too many lengths");
-        case GZ_ERROR_NO_END_OF_BLOCK_CODE:
-            __GZ_ERRCPY("No end-of-block code");
-        case GZ_ERROR_INCOMPLETE_ONLY_ONE:
-            __GZ_ERRCPY("Incomplete codes only allowed if just one code");
+        GZERR(GZ_ERROR_HUFF_OUT_OF_CODES,"Huffman decode: ran out of codes");
+        GZERR(GZ_ERROR_INVALID_FIXED_CODE,"Invalid fixed code");
+        GZERR(GZ_ERROR_HUFF_BAD_COUNTS,"Bad counts in dynamic block");
+        GZERR(GZ_ERROR_REQUIRE_COMPLETE_SET,"Require complete code set");
+        GZERR(GZ_ERROR_TOO_MANY_LENGTHS,"Too many lengths");
+        GZERR(GZ_ERROR_NO_END_OF_BLOCK_CODE,"No end-of-block code");
+        GZERR(GZ_ERROR_INCOMPLETE_ONLY_ONE,"Incomplete codes only allowed if just one code");
+        GZERR(GZ_ERROR_NO_LAST_LENGTH,"");
         
         // Library errors
-        case GZ_ERROR_END_OF_FILE:
-            __GZ_ERRCPY("EOF reached unexpectedly");
-        case GZ_ERROR_INPUT_FILE_BAD:
-            __GZ_ERRCPY("Could not open input file");
-        case GZ_ERROR_OUTPUT_FILE_BAD:
-            __GZ_ERRCPY("Could not open output file");
-        case GZ_ERROR_NOT_IMPLEMENTED:
-            __GZ_ERRCPY("Feature not implemented");
+        GZERR(GZ_ERROR_END_OF_FILE,"EOF reached unexpectedly");
+        GZERR(GZ_ERROR_INPUT_FILE_BAD,"Could not open input file");
+        GZERR(GZ_ERROR_OUTPUT_FILE_BAD,"Could not open output file");
+        GZERR(GZ_ERROR_NOT_IMPLEMENTED,"Feature not implemented");
     }
     
     __GZ_ERRCPY("Not an error");
@@ -408,21 +414,26 @@ stock _gz_PrintMemberToServer(id1, id2, cm, flg, mtime, xfl, os, crc32, isize,
     return;
 #endif
     
-    PrintToServer("ID1: %02x", id1);
-    PrintToServer("ID2: %02x", id2);
+    LogToGame("ID1: %02x", id1);
+    LogToGame("ID2: %02x", id2);
     
-    PrintToServer("CM: %d%s", cm, (cm == GZ_CM_DEFLATE) ? " (DEFLATE)" : "");
+    LogToGame("CM: %d%s", cm, (cm == GZ_CM_DEFLATE) ? " (DEFLATE)" : "");
     
-#define     __GZ_FLG(%1) (flg & (1<<(%1)) >> (%1))
-    PrintToServer("Flags:");
-    PrintToServer("   FTEXT    - %d", __GZ_FLG(0));
-    PrintToServer("   FHCRC    - %d", __GZ_FLG(1));
-    PrintToServer("   FEXTRA   - %d", __GZ_FLG(2));
-    PrintToServer("   FNAME    - %d", __GZ_FLG(3));
-    PrintToServer("   FCOMMENT - %d", __GZ_FLG(4));
-    PrintToServer("   reserved - %d", __GZ_FLG(5));
-    PrintToServer("   reserved - %d", __GZ_FLG(6));
-    PrintToServer("   reserved - %d", __GZ_FLG(7));
+#define     __GZ_FLG(%1) ((flg & (1<<(%1))) >> (%1))
+    LogToGame("Flags:");
+    LogToGame("   FTEXT    - %d", __GZ_FLG(0));
+    LogToGame("   FHCRC    - %d", __GZ_FLG(1));
+    LogToGame("   FEXTRA   - %d", __GZ_FLG(2));
+    LogToGame("   FNAME    - %d", __GZ_FLG(3));
+    LogToGame("   FCOMMENT - %d", __GZ_FLG(4));
+    LogToGame("   reserved - %d", __GZ_FLG(5));
+    LogToGame("   reserved - %d", __GZ_FLG(6));
+    LogToGame("   reserved - %d", __GZ_FLG(7));
+    
+    if (GZ_FLAG(flg, GZ_FLG_FNAME))
+        LogToGame("FNAME: \"%s\"", fname);
+    if (GZ_FLAG(flg, GZ_FLG_FCOMMENT))
+        LogToGame("FCOMMENT: \"%s\"", fcomment);
 }
 
 #define _GZ_BITS(%1,%2) \
@@ -432,13 +443,16 @@ stock _gz_PrintMemberToServer(id1, id2, cm, flg, mtime, xfl, os, crc32, isize,
 
 stock _gz_bits(GZ_STATE_DEF, need)
 {
+    ////////////////////////////////////////////////////////////////////////
+    LogToGame("bits(%d)", need, FilePosition(Handle:GZ_STATE[GZ_STATE_IN]));
+    
     decl val;
     
     // Load at least `need` bits into val
     val = GZ_STATE[GZ_STATE_BITBUF];
     while (GZ_STATE[GZ_STATE_BITCNT] < need)
     {
-        decl byte[1];
+        new byte[1];
         /* Load eight bits */
         if (ReadFile(Handle:GZ_STATE[GZ_STATE_IN], byte, 1, 1) != 1)
         {
@@ -446,17 +460,51 @@ stock _gz_bits(GZ_STATE_DEF, need)
             GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_END_OF_FILE;
             return -1;
         }
+
+        /////////////////////////////////////////////////////////////////////////
+        new String:bitbuf[] = "        ";
+        new String:valstr[] = "        ";
+        for (new i=7; i>=0; i--)
+        {
+            bitbuf[7-i] = '0' + ((GZ_STATE[GZ_STATE_BITBUF] & (1<<i)) >> i);
+            valstr[7-i] = '0' + ((val & (1<<i)) >> i);
+        }
+        LogToGame("  %-10s%-10s%-10s(%d)", "preread", valstr, bitbuf, GZ_STATE[GZ_STATE_BITCNT]);
         
         val |= byte[0] << GZ_STATE[GZ_STATE_BITCNT];
         GZ_STATE[GZ_STATE_BITCNT] += 8;
+        
+        /////////////////////////////////////////////////////////////////////////
+        for (new i=7; i>=0; i--)
+        {
+            bitbuf[7-i] = '0' + ((GZ_STATE[GZ_STATE_BITBUF] & (1<<i)) >> i);
+            valstr[7-i] = '0' + ((val & (1<<i)) >> i);
+        }
+        LogToGame("  %-10s%-10s%-10s(%d)", "postread", valstr, bitbuf, GZ_STATE[GZ_STATE_BITCNT]);
     }
     
     /* Drop `need` bits and update buffer, always zero to seven bits left */
-    GZ_STATE[GZ_STATE_BITBUF] = val >> need;
+    GZ_STATE[GZ_STATE_BITBUF] = (val >> need) & 0xFF;
     GZ_STATE[GZ_STATE_BITCNT] -= need;
     
     /* Return `need` bits, zeroing the bits above that */
-    return val & ((1 << need) - 1);
+    new bits = val & ((1 << need) - 1);
+    
+    /////////////////////////////////////////
+    new String:bin[] = "        ";
+    new String:bitbuf[] = "        ";
+    new String:valstr[] = "        ";
+    for (new i=7; i>=0; i--)
+    {
+        bin[7-i] = i == need ? ' ' : '0' + ((bits & (1<<i)) >> i);
+        bitbuf[7-i] = '0' + ((GZ_STATE[GZ_STATE_BITBUF] & (1<<i)) >> i);
+        valstr[7-i] = '0' + ((val & (1<<i)) >> i);
+    }
+    LogToGame("  %-10s%-10s%-10s(%-4d) (value: %d)", bin, valstr, bitbuf,
+              GZ_STATE[GZ_STATE_BITCNT], bits);
+    ////////////////////////////////////////////////////////////////
+    
+    return bits;
 }
 
 #define _GZ_BYTE(%1) \
@@ -471,6 +519,9 @@ stock _gz_bits(GZ_STATE_DEF, need)
 
 stock _gz_byte(GZ_STATE_DEF, peek)
 {
+    //////////////////////////////////////////////////////////
+    LogToGame("byte at %d", FilePosition(Handle:GZ_STATE[GZ_STATE_IN]));
+    
     decl buf[1];
     decl loc;
     
@@ -492,20 +543,25 @@ stock _gz_byte(GZ_STATE_DEF, peek)
     return buf[0];
 } 
 
-#define _GZ_BYTE_GET(%1,%2,%3) \
-    %1 = _gz_byte_get(_state, (%2), (%3)); \
+#define _GZ_BYTE_GET(%1,%2,%3,%4) \
+    %1 = _gz_byte_get(_state, (%2), (%3), (%4)); \
     if (%1 == -1 && _state[GZ_STATE_ERROR]) \
         return -1
 
-stock _gz_byte_get(GZ_STATE_DEF, loc, seek)
+stock _gz_byte_get(GZ_STATE_DEF, loc, seek, allow_invalid_distance)
 {
-    decl buf[1];
+    /////////////////////////////////////////////////////////////////////////////
+    LogToGame("byte_get(%d,%d) at %d", loc, seek,
+              FilePosition(Handle:GZ_STATE[GZ_STATE_IN]));////////////////////////////////////
+    
+    // Initialize buf to 0
+    new buf[1];
     
     new orig_loc = FilePosition(Handle:GZ_STATE[GZ_STATE_IN]);
     FileSeek(Handle:GZ_STATE[GZ_STATE_IN], loc, seek);
 
     new ret = ReadFile(Handle:GZ_STATE[GZ_STATE_IN], buf, 1, 1);
-    if (ret != 1)
+    if (ret != 1 && !allow_invalid_distance)
     {
         GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_INPUT_FILE_BAD;
         if (ret != -1)
@@ -520,7 +576,7 @@ stock _gz_byte_get(GZ_STATE_DEF, loc, seek)
 #define SLOW // FOR DEBUGGING PURPOSES ONLY
 #if defined(SLOW)
 stock _gz_decode(GZ_STATE_DEF, GZ_HUFF_DEF)
-{
+{LogToGame("decode");////////////////////////////////////
     decl len,   /* current number of bits in code */
          count; /* number of codes of length `len` */
     new  code,  /* `len` bits being decoded */
@@ -536,23 +592,21 @@ stock _gz_decode(GZ_STATE_DEF, GZ_HUFF_DEF)
         code |= bits;
         count = GZ_HUFF_COUNT[len];
         
-        /* if length `len`, return symbol */
-        if (code - count < first)
+        if (code - count < first)       /* if length `len`, return symbol */
             return GZ_HUFF_SYMBOL[index + (code - first)];
-        
-        index += count;
+        index += count;                 /* else update for next length */
         first += count;
         first <<= 1;
         code <<= 1;
     }
     
     GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_HUFF_OUT_OF_CODES;
-    return -1;
+    return -1;                          /* ran out of codes */
 }
 #endif
 
 stock _gz_construct(GZ_HUFF_DEF, length[], n)
-{
+{LogToGame("construct");////////////////////////////////////
     decl symbol;    /* current symbol when stepping through length[] */
     decl len;       /* current length when stepping through GZ_HUFF_COUNT */
     decl left;      /* number of possible codes left of current length */
@@ -570,8 +624,7 @@ stock _gz_construct(GZ_HUFF_DEF, length[], n)
     
     /* Check for an over-subscribed or incomplete set of lengths */
     left = 1;                           /* one possible code of zero length */
-    for (len = 1; len <= GZ_MAXBITS; len++)
-    {
+    for (len = 1; len <= GZ_MAXBITS; len++) {
         left <<= 1;                     /* one more bit, double codes left */
         left -= GZ_HUFF_COUNT[len];     /* deduct count from possible codes */
         if (left < 0) return left;      /* over-subscribed--return negative */
@@ -603,7 +656,7 @@ stock _gz_construct(GZ_HUFF_DEF, length[], n)
 #define GZ_HUFF_DIST_DEF        GZ_HUFF_DIST_COUNT[], GZ_HUFF_DIST_SYMBOL[]
 
 stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
-{
+{LogToGame("codes");////////////////////////////////////
     decl symbol;        /* decoded symbol */
     decl len;           /* length for copy */
     decl dist;          /* distance for copy */
@@ -632,6 +685,7 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
             /* write out the literal */
             decl b[1];
             b[0] = symbol;
+            LogToGame("write('%c')", symbol);///////////////////////////
             if (!WriteFile(Handle:GZ_STATE[GZ_STATE_OUT], b, 1, 1)) {
                 GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
                 return -1;
@@ -659,11 +713,10 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
             dist = dists[symbol] + bits;
             
             /* copy length bytes from distance bytes back */
-            while (len--) {
+            for (new i=0; i<len; i++) {
                 decl byte[1];
-                /////////////////////////////////////////////////////////////////
-                PrintToServer("pos: %d", FilePosition(Handle:GZ_STATE[GZ_STATE_IN]));
-                _GZ_BYTE_GET(byte[0],-dist,SEEK_CUR);
+                _GZ_BYTE_GET(byte[0],-dist + i,SEEK_CUR,true);
+                LogToGame("write('%c')", byte[0]);///////////////////////////
                 if (!WriteFile(Handle:GZ_STATE[GZ_STATE_OUT], byte, 1, 1)) {
                     GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_OUTPUT_FILE_BAD;
                     return -1;
@@ -677,7 +730,7 @@ stock _gz_codes(GZ_STATE_DEF, GZ_HUFF_LEN_DEF, GZ_HUFF_DIST_DEF)
 }
 
 stock _gz_stored(GZ_STATE_DEF)
-{
+{LogToGame("stored");////////////////////////////////////
     decl len;   /* Length of stored block */
 
     /* Discard leftover bits from current byte (assumes BITCNT < 8) */
@@ -722,7 +775,7 @@ stock _gz_stored(GZ_STATE_DEF)
 }
 
 stock _gz_fixed(GZ_STATE_DEF)
-{
+{LogToGame("fixed");////////////////////////////////////
     static virgin = 1;
     static lencnt[GZ_MAXBITS + 1], lensym[GZ_FIXLCODES];
     static distcnt[GZ_MAXBITS + 1], distsym[GZ_MAXDCODES];
@@ -760,7 +813,7 @@ stock _gz_fixed(GZ_STATE_DEF)
 }
 
 stock _gz_dynamic(GZ_STATE_DEF)
-{
+{LogToGame("dynamic");////////////////////////////////////
     decl bits;                          /* buffer for _GZ_BITS calls */
     decl nlen, ndist, ncode;            /* number of lengths in descriptor */
     decl index;                         /* index of lengths[] */
@@ -774,8 +827,10 @@ stock _gz_dynamic(GZ_STATE_DEF)
     /* get number of lengths in each table */
     _GZ_BITS(bits,5);
     nlen = bits + 257;
+    
     _GZ_BITS(bits,5);
     ndist = bits + 1;
+    
     _GZ_BITS(bits,4);
     ncode = bits + 4;
     
@@ -814,12 +869,15 @@ stock _gz_dynamic(GZ_STATE_DEF)
         symbol = _gz_decode(GZ_STATE, lencnt, lensym);
         if (symbol == -1 && GZ_STATE[GZ_STATE_ERROR])
             return -1;
-        else if (symbol < 16)           /* length in 0..15 */
+        if (symbol < 16)           /* length in 0..15 */
             lengths[index++] = symbol;
         else {                          /* repeat instruction */
             len = 0;                    /* assume repeating zeros */
             if (symbol == 16) {         /* repeat last length 3..6 times */
-                if (index == 0) return -5;      /* no last length! */
+                if (index == 0) {       /* no last length! */
+                    GZ_STATE[GZ_STATE_ERROR] = GZ_ERROR_NO_LAST_LENGTH;
+                    return -1;
+                }
                 len = lengths[index - 1];       /* last length */
                 
                 _GZ_BITS(bits,2);
